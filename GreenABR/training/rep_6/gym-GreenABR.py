@@ -10,18 +10,22 @@ import pandas as pd
 
 from joblib import dump, load
 
+import gym
+from gym import spaces
+from gym.envs.registration import register
 from torch.utils.tensorboard import SummaryWriter
+from stable_baselines.common.env_checker import check_env
 
 # Constants and training parameters
 
-MODEL_NAME = 'GreenABR'
+MODEL_NAME = 'gymGreenABR'
 S_DIM = 7  # for VMAF included model
 VIDEO_BIT_RATE = [300, 750, 1200, 1850, 2850, 4300]  # Kbps
 BUFFER_NORM_FACTOR = 10.0
 CHUNK_TIL_VIDEO_END_CAP = 45.0  # number of chunks in the video
 M_IN_K = 1000.0
 M_IN_N = 1000000.0
-REBUF_PENALTY = 4.3  # 1 sec rebuffering 
+REBUF_PENALTY = 4.3  # 1 sec rebuffering
 SMOOTH_PENALTY = 1
 RANDOM_SEED = 42
 TRAIN_TRACES = '../cooked_traces/'  # network traces for training
@@ -144,9 +148,18 @@ def baseline_model():
     return model
 
 
-# streaming environment for training
-class Environment:
+########################################################################################################################
+#                                                                                                                      #
+#                                                 ENVIRONMENT                                                          #
+#                                                                                                                      #
+########################################################################################################################
+
+class ABREnv(gym.Env):
+    """Custom Environment that follows gym interface"""
+
     def __init__(self, all_cooked_time, all_cooked_bw, random_seed=RANDOM_SEED):
+        super(ABREnv, self).__init__()
+
         self.MILLISECONDS_IN_SECOND = 1000.0
         self.B_IN_MB = 1000000.0
         self.BITS_IN_BYTE = 8.0
@@ -174,26 +187,8 @@ class Environment:
         self.video_chunk_counter = 0
         self.buffer_size = 0
 
-        # pick a random trace file
-        self.trace_idx = np.random.randint(len(self.all_cooked_time))
-        self.cooked_time = self.all_cooked_time[self.trace_idx]
-        self.cooked_bw = self.all_cooked_bw[self.trace_idx]
-
-        # randomize the start point of the trace
-        # note: trace file starts with time 0
-        self.mahimahi_ptr = np.random.randint(1, len(self.cooked_bw))
-        self.last_mahimahi_time = self.cooked_time[self.mahimahi_ptr - 1]
-
-        self.video_size = {}  # in bytes
-        for bitrate in range(self.BITRATE_LEVELS):
-            self.video_size[bitrate] = []
-            with open(self.VIDEO_SIZE_FILE + str(bitrate)) as f:
-                for line in f:
-                    self.video_size[bitrate].append(int(line.split()[0]))
-
-    def reset(self):
-        self.video_chunk_counter = 0
-        self.buffer_size = 0
+        ####################################################################
+        self.last_bit_rate = 0
 
         # pick a random trace file
         self.trace_idx = np.random.randint(len(self.all_cooked_time))
@@ -212,7 +207,13 @@ class Environment:
                 for line in f:
                     self.video_size[bitrate].append(int(line.split()[0]))
 
-        return np.zeros(S_DIM)
+        self.action_space = spaces.Discrete(len(VIDEO_BIT_RATE))
+        self.observation_space = spaces.Box(
+            low=np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            high=np.array([np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf], dtype=np.float32),
+            shape=(S_DIM,),
+            dtype=np.float32
+        )
 
     def get_video_chunk(self, quality):
 
@@ -233,7 +234,7 @@ class Environment:
 
             if video_chunk_counter_sent + packet_payload > video_chunk_size:
                 fractional_time = (
-                                              video_chunk_size - video_chunk_counter_sent) / throughput / self.PACKET_PAYLOAD_PORTION
+                                          video_chunk_size - video_chunk_counter_sent) / throughput / self.PACKET_PAYLOAD_PORTION
                 delay += fractional_time
                 self.last_mahimahi_time += fractional_time
                 assert (self.last_mahimahi_time <= self.cooked_time[self.mahimahi_ptr])
@@ -321,7 +322,8 @@ class Environment:
 
         return self.video_chunk_counter, delay, sleep_time, return_buffer_size / self.MILLISECONDS_IN_SECOND, rebuf / self.MILLISECONDS_IN_SECOND, video_chunk_size, next_video_chunk_sizes, end_of_video, video_chunk_remain
 
-    # normalize the attributes for power model
+        # normalize the attributes for power model
+
     def normalize_parameters(self, bitrate, t_sec):
         time = self.video_chunk_counter * SEGMENT_SIZE + t_sec
         b_n = VIDEO_BIT_RATE[bitrate] / BITRATE_MAX
@@ -342,16 +344,16 @@ class Environment:
             total_energy += power
         return total_energy
 
-    # corresponds to an ABR selection at every video chunk    
-    def step(self, bit_rate, last_bit_rate):
-        video_chunk_counter, delay, sleep_time, buffer_size, rebuf, video_chunk_size, next_video_chunk_sizes, end_of_video, video_chunk_remain = self.get_video_chunk(
-            bit_rate)
+    def step(self, action):
+        bit_rate = action
+        (video_chunk_counter, delay, sleep_time, buffer_size, rebuf, video_chunk_size,
+         next_video_chunk_sizes, end_of_video, video_chunk_remain) = self.get_video_chunk(bit_rate)
         throughput = float(video_chunk_size) / float(delay) / M_IN_K  # convert to MBps
 
         #         print(throughput)
         if video_chunk_counter == 0:
             video_chunk_counter = self.TOTAL_VIDEO_CHUNCK
-        new_state = np.zeros(S_DIM)
+        new_state = np.zeros(S_DIM, dtype=np.float32)
         new_state[0] = VIDEO_BIT_RATE[bit_rate] / float(np.max(VIDEO_BIT_RATE))
         new_state[1] = buffer_size / BUFFER_NORM_FACTOR
         new_state[2] = throughput  # original throughput
@@ -376,12 +378,45 @@ class Environment:
         else:
             smooth_penalty = SMOOTH_PENALTY * np.abs(
                 (PHONE_VMAF['VMAF_' + str(bit_rate + 1)][video_chunk_counter - 1] / 20.0) - (
-                            PHONE_VMAF['VMAF_' + str(last_bit_rate + 1)][video_chunk_counter - 2] / 20.0))
+                        PHONE_VMAF['VMAF_' + str(self.last_bit_rate + 1)][video_chunk_counter - 2] / 20.0))
+
+        ######################################################################################################
+        self.last_bit_rate = bit_rate
+
         reward = quality_reward - rebuffer_penalty - smooth_penalty
         energy_penalty = Calculate_Energy_Penalty(estimated_energy)
         reward = reward + energy_penalty
         #         print('Quality: {} Rebuffer Pen {} Smoothness Penalty {} Energy Penalty {} Estimated Energy {}'.format(quality_reward, rebuffer_penalty, smooth_penalty, energy_penalty, estimated_energy))
-        return new_state, reward, end_of_video, estimated_energy, video_chunk_size, quality, rebuffer_penalty, smooth_penalty, energy_penalty
+
+        observation = new_state
+        done = end_of_video
+        info = {'estimated_energy': estimated_energy, 'video_chunk_size': video_chunk_size, 'quality': quality,
+                'rebuffer_penalty': rebuffer_penalty, 'smooth_penalty': smooth_penalty,
+                'energy_penalty': energy_penalty}
+        return observation, reward, done, info
+
+    def reset(self):
+        self.video_chunk_counter = 0
+        self.buffer_size = 0
+
+        # pick a random trace file
+        self.trace_idx = np.random.randint(len(self.all_cooked_time))
+        self.cooked_time = self.all_cooked_time[self.trace_idx]
+        self.cooked_bw = self.all_cooked_bw[self.trace_idx]
+
+        # randomize the start point of the trace
+        # note: trace file starts with time 0
+        self.mahimahi_ptr = np.random.randint(1, len(self.cooked_bw))
+        self.last_mahimahi_time = self.cooked_time[self.mahimahi_ptr - 1]
+
+        self.video_size = {}  # in bytes
+        for bitrate in range(self.BITRATE_LEVELS):
+            self.video_size[bitrate] = []
+            with open(self.VIDEO_SIZE_FILE + str(bitrate)) as f:
+                for line in f:
+                    self.video_size[bitrate].append(int(line.split()[0]))
+
+        return np.zeros(S_DIM, dtype=np.float32)
 
 
 class ReplayBuffer(object):
@@ -521,12 +556,22 @@ class DDQNAgent(object):
 
 
 def main():
-    writer = SummaryWriter('runs/exp0')
+    writer = SummaryWriter('runs/exp1')
     step = 0
 
     all_cooked_time, all_cooked_bw, _ = load_trace(TRAIN_TRACES)
     input_dims = 7  # for VMAF included model
-    env = Environment(all_cooked_time, all_cooked_bw, RANDOM_SEED)
+
+    ######################################################################################################
+    kwargs = {'all_cooked_time':all_cooked_time, 'all_cooked_bw':all_cooked_bw, 'random_seed':RANDOM_SEED}
+    register(
+        id='ABREnv-v0',
+        entry_point='__main__:ABREnv',
+        kwargs=kwargs
+    )
+    env = gym.make('ABREnv-v0')
+    check_env(env, warn=True)
+
     ddqn_agent = DDQNAgent(alpha=0.0001, gamma=0.99, n_actions=6, epsilon=1.0, batch_size=64, input_dims=input_dims)
     n_games = 30000  # number of iterations to be used in training
     # ddqn_agent.load_model()
@@ -558,8 +603,11 @@ def main():
         observation = env.reset()
         while not done:
             action = ddqn_agent.choose_action(observation)
-            observation_, reward, done, energy, data, quality, rebuffer_penalty, smooth_penalty, energy_penalty = env.step(
-                action, last_bit_rate)
+            observation_, reward, done, info = env.step(action)
+
+            ######################################################################################################
+            energy, data, quality, rebuffer_penalty, smooth_penalty, energy_penalty = info.values()
+
             score += quality - rebuffer_penalty - smooth_penalty
             #         print("Action {0} , reward {1}, energy {2}, energy_pen {3}, reb_pen {4}, quality {5}, sm_pen {6}".format(action,reward,energy, energy_penalty, rebuffer_penalty, quality, smooth_penalty))
             total_energy += energy
@@ -634,3 +682,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
